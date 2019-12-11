@@ -37,5 +37,8 @@ target_link_libraries(rknn_ssd ${link_libs})
 add_executable(sreen_show  screen_show.cpp v4l2/v4l2.cpp screen/screen.cpp config.cpp)
 target_link_libraries(sreen_show ${link_libs})
 
-add_executable(mt_ssd  rknn_ssd_multi.cpp v4l2/v4l2.cpp screen/screen.cpp)
-target_link_libraries(mt_ssd ${link_libs})
+#add_executable(mt_ssd  rknn_ssd_multi.cpp v4l2/v4l2.cpp screen/screen.cpp knn/knn.cpp config.cpp)
+#target_link_libraries(mt_ssd ${link_libs})
+
+add_executable(mt_ssd_syj  rknn_ssd_multi_syj.cpp v4l2/v4l2.cpp screen/screen.cpp knn/knn.cpp config.cpp)
+target_link_libraries(mt_ssd_syj ${link_libs})

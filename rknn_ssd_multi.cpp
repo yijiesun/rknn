@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "v4l2/v4l2.h" 
 #include "screen/screen.h"
+#include "knn/knn.h"
 #include "rknn_api.h"
 #include "opencv2/core/core.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
@@ -41,6 +42,7 @@ using namespace std::chrono;
 #define H_SCALE  5.0f
 #define W_SCALE  5.0f
 
+#define CLIP(a,b,c) (  (a) = (a)>(c)?(c):((a)<(b)?(b):(a))  )
 #define __AVE_TIC__(tag) static int ____##tag##_total_time=0; \
         static int ____##tag##_total_conut=0;\
         timeval ____##tag##_start_time, ____##tag##_end_time;\
@@ -49,18 +51,24 @@ using namespace std::chrono;
 #define __AVE_TOC__(tag) gettimeofday(&____##tag##_end_time, 0); \
         ____##tag##_total_conut++; \
         ____##tag##_total_time+=((int)____##tag##_end_time.tv_sec-(int)____##tag##_start_time.tv_sec)*1000000+((int)____##tag##_end_time.tv_usec-(int)____##tag##_start_time.tv_usec); \
-        fprintf(stderr,  #tag ": %d us\n", ____##tag##_total_time/____##tag##_total_conut);
+        std::fprintf(stderr,  #tag ": %d us\n", ____##tag##_total_time/____##tag##_total_conut);
 
 #define __TIC__(tag) timeval ____##tag##_start_time, ____##tag##_end_time;\
         gettimeofday(&____##tag##_start_time, 0);
 
 #define __TOC__(tag) gettimeofday(&____##tag##_end_time, 0); \
         int ____##tag##_total_time=((int)____##tag##_end_time.tv_sec-(int)____##tag##_start_time.tv_sec)*1000000+((int)____##tag##_end_time.tv_usec-(int)____##tag##_start_time.tv_usec); \
-        fprintf(stderr,  #tag ": %d us\n", ____##tag##_total_time);
+        std::fprintf(stderr,  #tag ": %f ms\n", ____##tag##_total_time/1000.0);
 
 
-
+bool first_init_knn = true;
+int  IMG_WID=640;
+int  IMG_HGT=480;
+int knn_conf[5] = { 2, 1, 5, 5, 10};
+vector<Box>	boxes_all; 
+vector<Box>	boxes[2]; 
 V4L2 v4l2_;
+KNN_BGS knn_bgs;
 SCREEN screen_;
 unsigned int screen_pos_x,screen_pos_y;
 unsigned int * pfb;
@@ -78,13 +86,18 @@ public:
         return n1.first > n2.first;
     }
 };
-
+mutex mtxBoxes;
+mutex mtxKnn;
+mutex mtxShowImg;
 mutex mtxQueueInput;               // mutex of input queue
 mutex mtxQueueShow;                // mutex of display queue
-queue<pair<int, Mat>> queueInput;  // input queue
+queue<Mat> queueInput;  // input queue
+queue<Mat> queueInput_knn;  // input queue knn
+queue<Mat> queuePuzzle;
+
 priority_queue<imagePair, vector<imagePair>, paircomp>
         queueShow;  // display queue
-
+Mat show_img;
 #ifdef SHOWTIME
 #define _T(func)                                                              \
     {                                                                         \
@@ -250,9 +263,164 @@ int nms(int validCount, float* outputLocations, int (*output)[NUM_RESULTS])
     return 0;
 }
 
+void draw_img(Mat &img)
+{
+    int line_width=300*0.002;
+    for(int i=0;i<(int)boxes_all.size();i++)
+    {
+        Box box=boxes_all[i];
+        cv::rectangle(img, cv::Rect(box.x0, box.y0,(box.x1-box.x0),(box.y1-box.y0)),cv::Scalar(255, 255, 0),line_width);
+        cout<<"draw_img "<<box.x0<<","<<box.y0<<","<<box.x1<<","<<box.y1<<endl;
+        // std::ostringstream score_str;
+        // score_str<<box.score;
+        // std::string label = "person";
+        // int baseLine = 0;
+        // cv::Size label_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+        // cv::rectangle(img, cv::Rect(cv::Point(box.x0,box.y0- label_size.height),
+        //                           cv::Size(label_size.width, label_size.height + baseLine)),
+        //               cv::Scalar(255, 255, 0), -1);
+        // cv::putText(img, label, cv::Point(box.x0, box.y0),
+        //             cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+    }
+
+}
+
+int box_in_which_rec(Box &b0,vector<REC_BOX> &knn_recs_)
+{
+    int pos = 0;
+    float percent = 0;
+    vector<REC_BOX>::iterator it;
+
+    Rect tmp;
+    for(int i=0;i<knn_recs_.size();i++)
+    {
+        Rect rbox(b0.x0-knn_bgs.pos_x_in_rec_box[i]+knn_recs_[i].rec.x,b0.y0+knn_recs_[i].rec.y,b0.x1-b0.x0,b0.y1-b0.y0);
+        cout<<"box_in_which_rec "<<"boundRect["<<i<<"]:"<<knn_recs_[i].rec.x<<","<<knn_recs_[i].rec.y<<","<<knn_recs_[i].rec.height<<","<<knn_recs_[i].rec.width<<endl;
+        float p=knn_bgs.DecideOverlap(rbox,knn_recs_[i].rec,tmp);
+        if(p>percent)
+        {
+            pos = i;
+            cout<<"box_in_which_rec "<<"p>percent "<<p<<","<<percent<<"  pos:"<<pos<<endl;
+            percent = p;
+        }
+        if(percent>0.5)
+        {
+            b0.x0 -= knn_bgs.pos_x_in_rec_box[pos];
+            return pos;
+        }
+        else  
+            return -1;
+    }
+    return -1;
+}
+
+void togetherAllBox(int th_num,vector<Box> &b0,vector<Box> &b_all ,vector<REC_BOX> &knn_recs_)
+{
+  cout<<"togetherAllBox th_num "<<th_num<<", rec size:"<<b0.size()<<endl;
+  boxes_all.clear();
+    if(th_num==0)
+    {
+        for (int i = 0; i<b0.size(); i++) {
+            float bx0 = b0[i].x0, by0 = b0[i].y0, bx1= b0[i].x1, by1 = b0[i].y1;
+
+            int pos = box_in_which_rec(b0[i],knn_recs_);
+            cout<<"togetherAllBox "<<"["<<th_num<<"] x0y0x1y1,pos:"<<bx0<<","<<by0<<","<<bx1<<","<<by1<<"          "<<pos<<endl;
+            
+            if(pos>=0)
+            {
+                knn_recs_[pos].have_box = 1;
+                cout<<"togetherAllBox "<<"["<<pos<<"] wyhw:"<<knn_recs_[pos].rec.x<<","<<knn_recs_[pos].rec.y<<","<<knn_recs_[pos].rec.height<<","<<knn_recs_[pos].rec.width<<endl;
+                b0[i].x0= bx0 + knn_recs_[pos].rec.x;
+                b0[i].y0 = by0 + knn_recs_[pos].rec.y;
+                b0[i].x1 = bx1 + knn_recs_[pos].rec.x;
+                b0[i].y1 = by1 + knn_recs_[pos].rec.y;
+                CLIP(b0[i].x0,0,IMG_WID-1);
+                CLIP(b0[i].y0,0,IMG_HGT-1);
+                CLIP(b0[i].x1,0,IMG_WID-1);
+                CLIP(b0[i].y1,0,IMG_HGT-1);
+                boxes_all.push_back(b0[i]);
+            }
+	    }
+        for(int i=0;i<knn_recs_.size();i++)
+        {
+
+            if(knn_recs_[i].have_box)
+            {
+                Mat	tmp_hotmap = knn_bgs.hot_map(knn_recs_[i].rec);
+                tmp_hotmap.convertTo(tmp_hotmap, tmp_hotmap.type(), 1, 10);
+            }
+            else
+            {
+                Mat	tmp_hotmap = knn_bgs.hot_map(knn_recs_[i].rec);
+                tmp_hotmap.convertTo(tmp_hotmap, tmp_hotmap.type(), 1, -10);
+            }
+        }
+    }
+    else
+    {
+        for (int i = 0; i<b0.size(); i++) {
+            boxes_all.push_back(b0[i]);
+        }
+    }
+
+}
+
+void knnProcess()
+{
+  cpu_set_t mask;
+  int cpuid = 1;
+
+  CPU_ZERO(&mask);
+  CPU_SET(cpuid, &mask);
+
+  if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+    cerr << "set thread affinity failed" << endl;
+
+  std::printf("Bind knn process to CPU %d\n", cpuid); 
+
+  while (true) {
+    if (first_init_knn)
+      break;
+    sleep(1);
+  }
+
+  while (true) {
+    bool do_knn = false;
+    Mat pairIndexImage;
+    usleep(20000);
+    /*********************calc knn*********************/
+    mtxQueueInput.lock();
+    if (!queueInput.empty()) {
+      do_knn = true;
+      pairIndexImage = queueInput.front();
+      knn_bgs.frame = pairIndexImage.clone();
+      queueInput.pop();
+    }
+    mtxQueueInput.unlock();
+    if(do_knn)
+    {
+      mtxKnn.lock();
+      knn_bgs.pos ++;
+      knn_bgs.boundRect.clear();
+      knn_bgs.diff2(knn_bgs.frame, knn_bgs.bk);
+      knn_bgs.knn_core();
+      mtxBoxes.lock();
+      knn_bgs.processRects(boxes_all);
+      mtxBoxes.unlock();
+
+      knn_bgs.knn_puzzle(knn_bgs.frame);
+
+      
+      queuePuzzle.push(knn_bgs.puzzle_mat);
+      mtxKnn.unlock();
+    }
+
+    /*********************calc knn*********************/
+  }
+
+}
 void cameraRead() 
 {
-  int i = 0;
   int initialization_finished = 1;
   cpu_set_t mask;
   int cpuid = 2;
@@ -263,26 +431,18 @@ void cameraRead()
   if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
     cerr << "set thread affinity failed" << endl;
 
-  printf("Bind CameraCapture process to CPU %d\n", cpuid); 
-
-        // cv::VideoCapture camera(index);
-        // if (!camera.isOpened()) {
-        //         cerr << "Open camera error!" << endl;
-        //         exit(-1);
-        // }
-
-  // camera.set(3, 640);
-  // camera.set(4, 480);
-  // camera.set(5, 30.0);
+  std::printf("Bind CameraCapture process to CPU %d\n", cpuid); 
 
   while (true) {
     initialization_finished = 1;
-  
+    usleep(20000);
+    Mat img;
+    img.create(480,640,CV_8UC3);
+    img = Mat::zeros(480,640,CV_8UC3);
+    v4l2_.read_frame(img);
     for (int i = 0; i < sizeof(multi_npu_process_initialized) / sizeof(int); i++) {
-      //cout << i << " " << multi_npu_process_initialized << endl;
       if (multi_npu_process_initialized[i] == 0) {
         initialization_finished = 0;
-        //break;
       }
     }
 
@@ -305,82 +465,24 @@ void cameraRead()
                         cerr << "Fail to read image from camera!" << endl;
                         break;
                 }
+                if(first_init_knn)
+                {
+                  knn_bgs.bk = img.clone();
+                  first_init_knn = false;
+                }
+                mtxShowImg.lock();
+                show_img = img.clone();
+                mtxShowImg.unlock();
                 mtxQueueInput.lock();
-                if(queueInput.size() <= QUEUE_SIZE)
-                    queueInput.push(make_pair(idxInputImage++, img));
-                // if (queueInput.size() > QUEUE_SIZE) {
-                //         mtxQueueInput.unlock();
-                //         cout << "[Warning]input queue size is " << queueInput.size() << endl;
-                //         sleep(1);
-                // } else {
-                        mtxQueueInput.unlock();
-                // }
+                if(queueInput.size() < QUEUE_SIZE)
+                {
+                  cout<<"queueInput.push "<<idxInputImage<<endl;
+                  queueInput.push( img);
+                }
+                mtxQueueInput.unlock();
+
   }
 }
-
-// void videoRead(const char *video_name) 
-// {
-//         int i = 0;
-//   int initialization_finished = 1;
-//   int cpuid = 2;
-//   cpu_set_t mask;
-
-//   CPU_ZERO(&mask);
-//   CPU_SET(cpuid, &mask);
-
-//   if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
-//     cerr << "set thread affinity failed" << endl;
-
-//   printf("Bind VideoCapture process to CPU %d\n", cpuid); 
-
-//         cv::VideoCapture video;
-
-//         if (!video.open(video_name)) {
-//                 cout << "Fail to open " << video_name << endl;
-//                 return;
-//         }
-
-//   int frame_cnt = video.get(CV_CAP_PROP_FRAME_COUNT);
-
-//   while (true) {
-//     initialization_finished = 1;
-
-//     for (int i = 0; i < sizeof(multi_npu_process_initialized) / sizeof(int); i++) {
-//       //cout << i << " " << multi_npu_process_initialized << endl;
-//       if (multi_npu_process_initialized[i] == 0) {
-//         initialization_finished = 0;
-//         //break;
-//       }
-//     }
-
-//     if (initialization_finished)
-//       break;
-
-//     sleep(1);
-//   }
-
-//   start_time = chrono::system_clock::now();
-//         while (true) 
-//   {  
-//           usleep(1000);
-//     Mat img;
-
-//                 if (queueInput.size() < 30) {
-//       if (!video.read(img)) {
-//         cout << "read video stream failed!" << endl;
-//         return;
-//       }
-//       mtxQueueInput.lock();
-//       queueInput.push(make_pair(idxInputImage++, img));
-//                         mtxQueueInput.unlock();
-
-//       if (idxInputImage >= frame_cnt)
-//         break;
-//                 } else {
-//                         usleep(10);
-//                 }
-//   }
-// }
 
 void displayImage() {
   // Mat img;
@@ -393,42 +495,50 @@ void displayImage() {
   if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
     cerr << "set thread affinity failed" << endl;
 
-  printf("Bind Display process to CPU %d\n", cpuid); 
+  std::printf("Bind Display process to CPU %d\n", cpuid); 
 
     while (true) {
-        mtxQueueShow.lock();
-        if (queueShow.empty()) {
-            // mtxQueueShow.unlock();
-            usleep(10);
-        } else if (idxShowImage == queueShow.top().first) {
-            auto show_time = chrono::system_clock::now();
-            stringstream buffer;
-            Mat img = queueShow.top().second;
-            auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
-            buffer << fixed << setprecision(2)
-                   << (float)queueShow.top().first / (dura / 1000000.f);
-            string a = buffer.str() + "FPS";
-            cv::putText(img, a, cv::Point(15, 15), 1, 1, cv::Scalar{0, 0, 255},2);
+        Mat img_show;
+        mtxShowImg.lock();
+        img_show = show_img.clone();
+        mtxShowImg.unlock();
 
-            if(!img.empty())
-            {
-              v4l2_. mat_to_argb(img.data,pfb,640,480,screen_.vinfo.xres_virtual,0,0);
-              memcpy(screen_.pfb,pfb,screen_.finfo.smem_len);
-            }
+        mtxBoxes.lock();
+        draw_img(img_show);
+        // boxes_all.clear();
+        mtxBoxes.unlock();
 
+        mtxKnn.lock();
+        if(!knn_bgs.bk.empty())
+        {
+          Mat out,hot_map_color,hot_map_color2,hot_map_thresh_color,hot_map,pm;
+          hot_map = knn_bgs.hot_map;
 
-            // cv::imshow("RK3399Pro", img);  // display image
-            idxShowImage++;
-            queueShow.pop();
-            
-            // if (waitKey(1) == 'q') {
-            //     bReading = false;
-            //     exit(0);
-            // }
-        } else {
-            // mtxQueueShow.unlock();
+          cv::cvtColor(knn_bgs.FGMask, hot_map_color2, CV_GRAY2BGR);  
+          cv::cvtColor(knn_bgs.hot_map, hot_map_thresh_color, CV_GRAY2BGR);  
+          hconcat(img_show,knn_bgs.bk,out);
+          // resize(knn_bgs.puzzle_mat, pm, img_show.size(), 0, 0,  cv::INTER_LINEAR); 
+          // hconcat(img_show,pm,out);
+          mtxKnn.unlock();
+          hconcat(hot_map_color2,hot_map_thresh_color,hot_map_color2);
+          vconcat(out,hot_map_color2,out);
+      
+          // string no=to_string(frame_cnt);
+          // Point siteNo;
+          // siteNo.x = 25;
+          // siteNo.y = 25;
+          // putText( out, no, siteNo, 2,1,Scalar( 255, 0, 0 ), 4);
+          resize(out, img_show, img_show.size(), 0, 0,  cv::INTER_LINEAR); 
+
+          v4l2_. mat_to_argb(img_show.data,pfb,640,480,screen_.vinfo.xres_virtual,0,0);
+          memcpy(screen_.pfb,pfb,screen_.finfo.smem_len);
         }
-        mtxQueueShow.unlock();
+        else
+        {
+          mtxKnn.unlock();
+        }
+        
+
     }
 }
 
@@ -452,14 +562,18 @@ void run_process(int thread_id, void *pmodel, int model_len)
   const int output_index2 = 1;    // node name "concat_1"
 
   cv::Mat resimg;
-
+  Mat	img_roi;
   cpu_set_t mask;
   int cpuid = 0;
 
   if (thread_id == 0)
-    cpuid = 4;
+  {
+   cpuid = 4;
+  }
   else if (thread_id == 1)
-    cpuid = 5;
+  {
+   cpuid = 5;
+  }
   else
     cpuid = 0;
 
@@ -469,7 +583,7 @@ void run_process(int thread_id, void *pmodel, int model_len)
   if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
     cerr << "set thread affinity failed" << endl;
 
-  printf("Bind NPU process(%d) to CPU %d\n", thread_id, cpuid); 
+  std::printf("Bind NPU process(%d) to CPU %d\n", thread_id, cpuid); 
 
   // Start Inference
   rknn_input inputs[1];
@@ -481,21 +595,21 @@ void run_process(int thread_id, void *pmodel, int model_len)
 
   ret = rknn_init(&ctx, pmodel, model_len, RKNN_FLAG_PRIOR_MEDIUM);
   if(ret < 0) {
-    printf("rknn_init fail! ret=%d\n", ret);
+    std::printf("rknn_init fail! ret=%d\n", ret);
     return;
   }
 
   outputs_attr[0].index = 0;
   ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &(outputs_attr[0]), sizeof(outputs_attr[0]));
   if(ret < 0) {
-    printf("rknn_query fail! ret=%d\n", ret);
+    std::printf("rknn_query fail! ret=%d\n", ret);
     return;
   }
 
   outputs_attr[1].index = 1;
   ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &(outputs_attr[1]), sizeof(outputs_attr[1]));
   if(ret < 0) {
-    printf("rknn_query fail! ret=%d\n", ret);
+    std::printf("rknn_query fail! ret=%d\n", ret);
     return;
   }
 
@@ -503,31 +617,67 @@ void run_process(int thread_id, void *pmodel, int model_len)
     return;
 
   multi_npu_process_initialized[thread_id] = 1;
-  printf("The initialization of NPU Process %d has been completed.\n", thread_id);
+  std::printf("The initialization of NPU Process %d has been completed.\n", thread_id);
   __TOC__(NPU_INIT);
 #endif
   while (true) {
     __TIC__(thread_id);
-    // cout<<"process 0"<<endl;
-    pair<int, Mat> pairIndexImage;
-    mtxQueueInput.lock();
-    // cout<<"mtxQueueInput.lock()"<<endl;
-    if (queueInput.empty()) {
-      mtxQueueInput.unlock();
-      usleep(20000);
-      if (bReading)
-        continue;
-      else
-        break;
-      } else {
-        // Get an image from input queue
-        pairIndexImage = queueInput.front();
-        queueInput.pop();
-        // mtxQueueInput.unlock();
+      if (thread_id == 0)
+      {
+          mtxKnn.lock();
+          if(!queuePuzzle.empty())
+          {
+            img_roi = queuePuzzle.front().clone();
+            queuePuzzle.pop();
+            mtxKnn.unlock();
+            for(int i=0;i<knn_bgs.boundRect.size();i++)
+            {
+              mtxShowImg.lock();
+              Mat	img_show = show_img(knn_bgs.boundRect[i].rec);
+              img_show.convertTo(img_show, img_show.type(), 1, 30);
+              mtxShowImg.unlock();
+            }
+          }
+          else
+          {
+            mtxKnn.unlock();
+            continue;
+          }
       }
-      mtxQueueInput.unlock();
+      else if (thread_id == 1)
+      {
+        mtxKnn.lock();
+        if(!queueInput.empty())
+        {
+          img_roi = queueInput.front().clone();
+          mtxKnn.unlock();
+        }
+        else
+        {
+          mtxKnn.unlock();
+          continue;
+        }
+      }
+    // // cout<<"process 0"<<endl;
+    // pair<int, Mat> pairIndexImage;
+    // mtxQueueInput.lock();
+    // // cout<<"mtxQueueInput.lock()"<<endl;
+    // if (queueInput.empty()) {
+    //   mtxQueueInput.unlock();
+    //   usleep(20000);
+    //   if (bReading)
+    //     continue;
+    //   else
+    //     break;
+    //   } else {
+    //     // Get an image from input queue
+    //     pairIndexImage = queueInput.front();
+    //     queueInput.pop();
+    //     // mtxQueueInput.unlock();
+    //   }
+    //   mtxQueueInput.unlock();
       #if 1
-      cv::resize(pairIndexImage.second, resimg, cv::Size(img_width, img_height), (0, 0), (0, 0), cv::INTER_LINEAR);
+      cv::resize(img_roi, resimg, cv::Size(img_width, img_height), (0, 0), (0, 0), cv::INTER_LINEAR);
 
       inputs[0].index = input_index;
       inputs[0].buf = resimg.data;
@@ -537,13 +687,13 @@ void run_process(int thread_id, void *pmodel, int model_len)
       inputs[0].fmt = RKNN_TENSOR_NHWC;
       ret = rknn_inputs_set(ctx, 1, inputs);
       if(ret < 0) {
-          printf("rknn_input_set fail! ret=%d\n", ret);
+          std::printf("rknn_input_set fail! ret=%d\n", ret);
           return;
       }
 
       ret = rknn_run(ctx, nullptr);
       if(ret < 0) {
-          printf("rknn_run fail! ret=%d\n", ret);
+          std::printf("rknn_run fail! ret=%d\n", ret);
           return;
       }
 
@@ -553,9 +703,11 @@ void run_process(int thread_id, void *pmodel, int model_len)
       outputs[1].is_prealloc = false;
       ret = rknn_outputs_get(ctx, 2, outputs, nullptr);
       if(ret < 0) {
-          printf("rknn_outputs_get fail! ret=%d\n", ret);
+          std::printf("rknn_outputs_get fail! ret=%d\n", ret);
           return;
       }
+
+      boxes[thread_id].clear();
       if(outputs[0].size == outputs_attr[0].n_elems*sizeof(float) && outputs[1].size == outputs_attr[1].n_elems*sizeof(float))
       {
           float boxPriors[4][NUM_RESULTS];
@@ -574,7 +726,7 @@ void run_process(int thread_id, void *pmodel, int model_len)
           decodeCenterSizeBoxes(predictions, boxPriors);
 
           int validCount = scaleToInputSize(outputClasses, output, NUM_CLASSES);
-          //printf("validCount: %d\n", validCount);
+          //std::printf("validCount: %d\n", validCount);
 
           if (validCount < 100) {
             /* detect nest box */
@@ -587,35 +739,49 @@ void run_process(int thread_id, void *pmodel, int model_len)
                 }
                 int n = output[0][i];
                 int topClassScoreIndex = output[1][i];
+                if(topClassScoreIndex == 1)
+                {
+                    Box box;
+                    box.x0 = static_cast<float>(predictions[n * 4 + 1] * IMG_WID);
+                    box.y0 = static_cast<float>(predictions[n * 4 + 0] * IMG_HGT);
+                    box.x1 = static_cast<float>(predictions[n * 4 + 3] * IMG_WID);
+                    box.y1 = static_cast<float>(predictions[n * 4 + 2] * IMG_HGT);
+                   cout<<"ok "<<box.x0<<","<<box.y0<<","<<box.x1<<","<<box.y1<<endl;
+                    CLIP(box.x0,0,IMG_WID-1);
+                    CLIP(box.y0,0,IMG_HGT-1);
+                    CLIP(box.x1,0,IMG_WID-1);
+                    CLIP(box.y1,0,IMG_HGT-1);
+                    boxes[thread_id].push_back(box);
+                    // string label = labels[topClassScoreIndex];
+                    // rectangle(pairIndexImage.second, Point(x1, y1), Point(x2, y2), colorArray[topClassScoreIndex%10], 3);
+                    // putText(pairIndexImage.second, label, Point(x1, y1 - 12), 1, 2, Scalar(0, 255, 0, 255));
+                }
 
-                int x1 = static_cast<int>(predictions[n * 4 + 1] * pairIndexImage.second.cols);
-                int y1 = static_cast<int>(predictions[n * 4 + 0] * pairIndexImage.second.rows);
-                int x2 = static_cast<int>(predictions[n * 4 + 3] * pairIndexImage.second.cols);
-                int y2 = static_cast<int>(predictions[n * 4 + 2] * pairIndexImage.second.rows);
-
-                string label = labels[topClassScoreIndex];
-
-                //std::cout << label << "\t@ (" << x1 << ", " << y1 << ") (" << x2 << ", " << y2 << ")" << "\n";
-
-                rectangle(pairIndexImage.second, Point(x1, y1), Point(x2, y2), colorArray[topClassScoreIndex%10], 3);
-                putText(pairIndexImage.second, label, Point(x1, y1 - 12), 1, 2, Scalar(0, 255, 0, 255));
             }
           } else {
-              printf("validCount too much!\n");
+              std::printf("validCount too much!\n");
           }
       }
       else
       {
-          printf("rknn_outputs_get fail! get outputs_size = [%d, %d], but expect [%lu, %lu]!\n",
+          std::printf("rknn_outputs_get fail! get outputs_size = [%d, %d], but expect [%lu, %lu]!\n",
               outputs[0].size, outputs[1].size, outputs_attr[0].n_elems*sizeof(float), outputs_attr[1].n_elems*sizeof(float));
       }
+      vector<REC_BOX> knn_recs;
+      knn_recs.clear();
+      mtxKnn.lock();
+      knn_recs.assign(knn_bgs.boundRect.begin(),knn_bgs.boundRect.end());
+      mtxKnn.unlock();
+      mtxBoxes.lock();
+      togetherAllBox(thread_id, boxes[thread_id], boxes_all,knn_recs);
+      mtxBoxes.unlock();
       rknn_outputs_release(ctx, 2, outputs);
 #endif
-      mtxQueueShow.lock();
+      // mtxQueueShow.lock();
       // cout<<"mtxQueueShow input "<<queueShow.size()<<endl;
       // Put the processed iamge to show queue
-      queueShow.push(pairIndexImage);
-      mtxQueueShow.unlock();
+      // queueShow.push(pairIndexImage);
+      // mtxQueueShow.unlock();
       __TOC__(thread_id);
   }
 }
@@ -630,17 +796,30 @@ int main(const int argc, const char** argv)
 	v4l2_.init_device();
 	v4l2_.start_capturing();
   pfb = (unsigned int *)malloc(screen_.finfo.smem_len);
+  show_img.create(IMG_HGT,IMG_WID,CV_8UC3);
+  show_img = Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
+  knn_bgs.IMG_WID = IMG_WID;
+  knn_bgs.IMG_HGT = IMG_HGT;
+  knn_bgs.set(knn_conf);
+  knn_bgs.pos = 0;
+  knn_bgs.knn_box_exist_cnt = 5;
+  knn_bgs.useTopRect = knn_conf[3];
+  knn_bgs.knn_over_percent = 0.001f;
+  knn_bgs.tooSmalltoDrop = knn_conf[4];
+  knn_bgs.dilateRatio =  knn_bgs.IMG_WID  / 320 * 5;
+  knn_bgs.init();
+  boxes_all.clear();
 
   int i, cpus = 0;
   int camera_index;
   cpu_set_t mask;
   cpu_set_t get;
-  array<thread, 4> threads;
+  array<thread, 5> threads;
 
   const char *model_path = "/home/firefly/RKNN/rknn-api/Linux/tmp/mobilenet_ssd.rknn";
   FILE *fp = fopen(model_path, "rb");
   if(fp == NULL) {
-    printf("fopen %s fail!\n", model_path);
+    std::printf("fopen %s fail!\n", model_path);
     return -1;
   }
   fseek(fp, 0, SEEK_END);
@@ -649,18 +828,19 @@ int main(const int argc, const char** argv)
   void *model = malloc(model_len);
   fseek(fp, 0, SEEK_SET);
   if(model_len != fread(model, 1, model_len, fp)) {
-    printf("fread %s fail!\n", model_path);
+    std::printf("fread %s fail!\n", model_path);
     free(model);
     return -1;
   }
 
   cpus = sysconf(_SC_NPROCESSORS_CONF);
-  printf("This system has %d processor(s).\n", cpus);
+  std::printf("This system has %d processor(s).\n", cpus);
 
   // string mode = argv[1];
   // if (mode == "c") {
     // camera_index = atoi(argv[2]);
     threads = {thread(cameraRead),
+                                thread(knnProcess),
                                 thread(displayImage),
                                 thread(run_process, 0, model, model_len),
                                 thread(run_process, 1, model, model_len)
@@ -676,7 +856,7 @@ int main(const int argc, const char** argv)
   //   return -1;
   // }
 
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 5; i++)
     threads[i].join();
 
   return 0;
