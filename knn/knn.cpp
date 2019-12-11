@@ -7,7 +7,7 @@ using namespace std;
 #define CLIP(a,b,c) (  (a) = (a)>(c)?(c):((a)<(b)?(b):(a))  )
 KNN_BGS::KNN_BGS()
 {
-	framePixelHistory = NULL;
+	// framePixelHistory = NULL;
 	frameCnt = 0;
 };
 
@@ -34,15 +34,23 @@ void KNN_BGS::init()
 	DiffMask.create(IMG_HGT, IMG_WID, CV_8UC1);
 	process_frame.create(IMG_HGT,IMG_WID,CV_8UC3);
 	puzzle_mat=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
-	framePixelHistory = (PixelHistory*)malloc(IMG_WID*IMG_HGT * sizeof(PixelHistory));
-
-	for (int i = 0; i < IMG_WID*IMG_HGT; i++)
+	// framePixelHistory = (PixelHistory*)malloc(IMG_WID*IMG_HGT * sizeof(PixelHistory));
+	for(int i = 0;i<2;i++)
 	{
-		framePixelHistory[i].gray = (unsigned char*)malloc((history_num) * sizeof(unsigned char));
-		framePixelHistory[i].IsBG = (unsigned char*)malloc((history_num) * sizeof(unsigned char));
-		memset(framePixelHistory[i].gray, 0, (history_num ) * sizeof(unsigned char));
-		memset(framePixelHistory[i].IsBG, 0, (history_num ) * sizeof(unsigned char));
+		PixelHistory_gray[i].create(IMG_HGT,IMG_WID,CV_8UC1);
+		PixelHistory_gray[i]=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC1);
+		PixelHistory_isBG[i].create(IMG_HGT,IMG_WID,CV_8UC1);
+		PixelHistory_isBG[i]=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC1);
 	}
+
+
+	// for (int i = 0; i < IMG_WID*IMG_HGT; i++)
+	// {
+	// 	framePixelHistory[i].gray = (unsigned char*)malloc((history_num) * sizeof(unsigned char));
+	// 	framePixelHistory[i].IsBG = (unsigned char*)malloc((history_num) * sizeof(unsigned char));
+	// 	memset(framePixelHistory[i].gray, 0, (history_num ) * sizeof(unsigned char));
+	// 	memset(framePixelHistory[i].IsBG, 0, (history_num ) * sizeof(unsigned char));
+	// }
 	hot_map.create(IMG_HGT,IMG_WID,CV_8UC1);
 	hot_map=Mat::ones(IMG_HGT,IMG_WID,CV_8UC1)+100;
 }
@@ -55,6 +63,55 @@ void KNN_BGS::knn_core()
 	cout<<"CV_BGR2GRAY"<<endl;
 	FGMask_origin.setTo(Scalar(255));
 	int gray = 0;
+
+
+	/*FAST VERSION*/
+	Mat diff_gray[2],isbg[2],isbg_,diff_gray_,fgmask0,hot_map_255,human_roi_255,bk_cnt_up5,hot_map_up100,bkcntup5_hotmapup100,bk_cnt_cnt_up2;
+	isbg[0] = PixelHistory_isBG[0]*255;
+	isbg[1] = PixelHistory_isBG[1]*255;
+	bitwise_or(isbg[0],isbg[1],isbg_);
+	bitwise_not(isbg_,isbg_);
+	bitwise_and(isbg_,FGMask_origin,FGMask_origin);
+	hot_map_255 = hot_map*255;
+	human_roi_255 = human_roi*255;
+	bitwise_or(hot_map_255,hot_map_255,fgmask0);
+	bitwise_and(FGMask_origin,fgmask0,FGMask_origin);
+
+	absdiff(fgray,PixelHistory_gray[0],diff_gray[0]);
+	absdiff(fgray,PixelHistory_gray[1],diff_gray[1]);
+	diff_gray[0]-=20;
+	diff_gray[1]-=20;
+	diff_gray[0]*=255;
+	diff_gray[1]*=255;
+	bitwise_and(diff_gray[0],diff_gray[1],diff_gray_);
+	bitwise_not(diff_gray_,diff_gray_);
+	diff_gray_/=255;
+	int index = frameCnt % history_num;
+	PixelHistory_gray[index] = fgray;
+	PixelHistory_isBG[index] = diff_gray_;
+
+	bk_cnt_up5 = bk_cnt-6;
+	bk_cnt_up5*=255;
+	hot_map_up100 = hot_map-101;
+	hot_map_up100*=255;
+	bitwise_and(bk_cnt_up5,hot_map_up100,bkcntup5_hotmapup100);
+	hot_map-=bkcntup5_hotmapup100;
+	bk_cnt-=bkcntup5_hotmapup100;
+	frame.copyTo(bk, bkcntup5_hotmapup100);
+
+	bkcntup5_hotmapup100/=255;
+	bk_cnt_cnt+=bkcntup5_hotmapup100;
+	bkcntup5_hotmapup100*=100;
+	hot_map+=bkcntup5_hotmapup100;
+
+	bk_cnt_cnt_up2 = bk_cnt_cnt-3;
+	bk_cnt_cnt_up2*=255;
+	hot_map-=bk_cnt_cnt_up2;
+	bk_cnt-=bk_cnt_cnt_up2;
+	human_roi-=bk_cnt_cnt_up2;
+	/*FAST VERSION*/
+
+#if 0 
 	for (int i = 0; i < IMG_HGT; i++)
 	{
 		for (int j = 0; j < IMG_WID; j++)
@@ -66,15 +123,16 @@ void KNN_BGS::knn_core()
 
 			for (int n = 0; n < history_num; n++)
 			{
-				if (fabs((float)gray - framePixelHistory[i*IMG_WID + j].gray[n]) < 20 /* hot_map_thresh.data[i*IMG_WID + j] */  )
+				if (fabs((float)gray - PixelHistory_gray[n].data[i*IMG_WID + j]) < 20 /* hot_map_thresh.data[i*IMG_WID + j] */  )
 				{
 						fit++;
-					if (framePixelHistory[i*IMG_WID + j].IsBG[n])
+					if (PixelHistory_isBG[n].data[i*IMG_WID + j])
 					{
 						fit_bg++;
 					}
 				}
 			}
+
 			if (fit_bg >= knnv)
 			{
 				FGMask_origin.at<unsigned char>(i, j) = 0;
@@ -86,8 +144,8 @@ void KNN_BGS::knn_core()
 			}
 
 			int index = frameCnt % history_num;
-			framePixelHistory[i*IMG_WID + j].gray[index] = gray;
-			framePixelHistory[i*IMG_WID + j].IsBG[index] = fit >= knnv ? 1 : 0;
+			PixelHistory_gray[index].data[i*IMG_WID + j] = gray;
+			PixelHistory_isBG[index].data[i*IMG_WID + j]= fit >= knnv ? 1 : 0;
 
 			if(bk_cnt.data[i*IMG_WID + j]>=5)
 			{
@@ -104,6 +162,7 @@ void KNN_BGS::knn_core()
 					bk.data[i*IMG_WID*3 + j*3+2]= frame.data[i*IMG_WID*3 + j*3+2];
 				}
 			}
+
 			if(bk_cnt_cnt.data[i*IMG_WID + j]>=2)
 			{
 				hot_map.data[i*IMG_WID + j] = 0;
@@ -113,6 +172,7 @@ void KNN_BGS::knn_core()
 
 		}
 	}
+#endif
 	frameCnt++;
 }
 
@@ -320,7 +380,7 @@ void KNN_BGS::processRects(vector<Box> &box)
 	clearSmallRecs();
 	paddingRecs(boundRect, padSize);
 	mergeRecs(boundRect, knn_over_percent);
-	clearStrangeRecs();
+	// clearStrangeRecs();
 	boundRectTmp.shrink_to_fit();
 	contours.shrink_to_fit();
 	hierarcy.shrink_to_fit();

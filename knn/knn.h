@@ -45,6 +45,8 @@ public:
 	void init();
 	void knn_core();
 	void saveROI();
+	Mat PixelHistory_gray[2];
+	Mat PixelHistory_isBG[2];
 	Mat bg_fix_mask;
 	Mat last_frame;
 	Mat senser_roi_down100,senser_roi_down100_not;
@@ -76,7 +78,7 @@ public:
 	int find_son_block(vector<Rect> &rects,int begin,int max_wid,int max_hgt);
 	void clearStrangeRecs();
 private:  
-	PixelHistory* framePixelHistory;
+	// PixelHistory* framePixelHistory;
 	
 	int frameCnt;
 	

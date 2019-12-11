@@ -436,6 +436,7 @@ void mssd_core(rknn_context &ctx, int thread_num )
     Mat	img_roi;
     if(thread_num == 0)
     {
+      set_cpu(2);
         // return;
         for(int i=0;i<knn_bgs.boundRect.size();i++)
         {
@@ -450,6 +451,7 @@ void mssd_core(rknn_context &ctx, int thread_num )
     }
     else
     {
+      set_cpu(3);
         pthread_mutex_lock(&mutex_knn_bgs_frame);
         img_roi = knn_bgs.frame.clone();
         pthread_mutex_unlock(&mutex_knn_bgs_frame);
@@ -551,8 +553,19 @@ void *gpu_pthread(void *threadarg)
     mssd_core(rknn_ctx[0], 0);
 }
 
+void *knn_diff_pthread(void *threadarg)
+{
+  set_cpu(0);
+  knn_bgs.diff2(knn_bgs.frame, knn_bgs.bk);
+}
+void *knn_core_pthread(void *threadarg)
+{
+  set_cpu(1);
+  knn_bgs.knn_core();
+}
 int main(int argc, char* argv[])
 {
+  set_cpu(5);
     frame_cnt = 0;
     quit = false;
     bool first =true;
@@ -669,7 +682,7 @@ int main(int argc, char* argv[])
                 continue;      
         }
 
-        __TIC__(KNN);
+        __TIC__(KNN_CLONE);
         process_frame = frame.clone();
         pthread_mutex_lock(&mutex_show_img);
         show_img = frame.clone();
@@ -677,18 +690,37 @@ int main(int argc, char* argv[])
         pthread_mutex_lock(&mutex_knn_bgs_frame);
         knn_bgs.frame = process_frame.clone();
         pthread_mutex_unlock(&mutex_knn_bgs_frame);
+        __TOC__(KNN_CLONE);
         knn_bgs.pos ++;
         knn_bgs.boundRect.clear();
-        knn_bgs.diff2(process_frame, knn_bgs.bk);
-        knn_bgs.knn_core();
+
+
+
+        __TIC__(KNN_CORE_DIFF);
+        pthread_t threads_knn_diff;      
+        pthread_t threads_knn_core;
+        pthread_create(&threads_knn_diff, NULL, knn_diff_pthread, NULL);
+        pthread_create(&threads_knn_core, NULL, knn_core_pthread,NULL);
+        pthread_join(threads_knn_diff,NULL);
+        pthread_join(threads_knn_core,NULL);
+        __TOC__(KNN_CORE_DIFF);
+        // __TIC__(KNN_DIFF);
+        // knn_bgs.diff2(process_frame, knn_bgs.bk);
+        // __TOC__(KNN_DIFF);
+        //  __TIC__(KNN_CORE);
+        // knn_bgs.knn_core();
+        // __TOC__(KNN_CORE);
+        __TIC__(KNN_REC);
         pthread_mutex_lock(&mutex_box);
         knn_bgs.processRects(boxes_all);
         pthread_mutex_unlock(&mutex_box);
+        __TOC__(KNN_REC);
         boxes_all.clear();
+        __TIC__(KNN_PUZZ);
         knn_bgs.knn_puzzle(process_frame);
         for(int i=0;i<2;i++)
             boxes[i].clear();
-        __TOC__(KNN);
+        __TOC__(KNN_PUZZ);
 
         __TIC__(NPU);
         pthread_t threads_c;      
