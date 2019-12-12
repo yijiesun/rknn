@@ -401,3 +401,20 @@ void getTimesSec(char *param)
 		t->tm_min,
 		t->tm_sec);
 }
+int getTimesInt()
+{
+	time_t lastTime;
+	time(&lastTime);
+	time_t tt;
+	time(&tt);
+	tm* t;
+	lastTime = tt;
+	tt = tt + 8 * 3600;  // transform the time zone
+	t = gmtime(&tt);
+	
+	struct  timeb   stTimeb;
+	ftime(&stTimeb);
+	
+	int ret = (int) (t->tm_sec*+stTimeb.millitm*1000);
+	return ret;
+}

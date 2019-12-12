@@ -1,27 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * License); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * AS IS BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
-/*
- * Copyright (c) 2018, Open AI Lab
- * Author: chunyinglv@openailab.com
- */
-
 #include <unistd.h>
 #include <iostream>
 #include <iomanip>
@@ -39,6 +15,7 @@
 #include <fstream>
 #include <atomic>
 #include <queue>
+#include<deque>
 #include <thread>
 #include <mutex>
 #include <chrono>
@@ -80,25 +57,58 @@ const char *img_path1 = "/home/firefly/RKNN/rknn-api/Linux/tmp/dog.jpg";
 const char *model_path = "/home/firefly/RKNN/rknn-api/Linux/tmp/mobilenet_ssd.rknn";
 const char *label_path = "/home/firefly/RKNN/rknn-api/Linux/tmp/coco_labels_list.txt";
 const char *box_priors_path = "/home/firefly/RKNN/rknn-api/Linux/tmp/box_priors.txt";
+struct knn_s
+{
+  int time;
+  Mat puzzle;
+  vector<REC_BOX> boundRect;
+  vector<int> pos_x_in_rec_box;
+};
+struct show_knn
+{
+  Mat show_img;
+  Mat puzzle;
+  Mat fgmask;
+  vector<Box>	boxes_all; 
+};
 
-
+typedef show_knn SHOW_KNN;
+typedef knn_s KNN_S;
+typedef pair<int, Mat> imagePair;
+class paircompbig {
+public:
+    bool operator()(const imagePair &n1, const imagePair &n2) const {
+        if (n1.first == n2.first) return n1.first < n2.first;
+        return n1.first < n2.first;
+    }
+};
+class paircompless {
+public:
+    bool operator()(const imagePair &n1, const imagePair &n2) const {
+        if (n1.first == n2.first) return n1.first > n2.first;
+        return n1.first > n2.first;
+    }
+};
+struct timeval show_img_time;
+bool npu_calc[2]={false,false};
 int frame_cnt;
-int cpu_num_[2] ={0,1};
 int knn_conf[5] = { 2, 1, 5, 5, 10};
 V4L2 v4l2_;
+SHOW_KNN sk_;
 KNN_BGS knn_bgs;
-Mat process_frame;
-Mat background;
-cv::Mat final_img;
-Mat show_img;
 unsigned int * pfb;
 SCREEN screen_;
-pthread_mutex_t  mutex_knn_bgs_frame;
-pthread_mutex_t  mutex_show_img;
-pthread_mutex_t  mutex_box;
+pthread_mutex_t  mutex_hotmap_box;
+pthread_mutex_t  mutex_knn;
+pthread_mutex_t  mutex_show;
+pthread_mutex_t  mutex_frameIn;
+pthread_mutex_t  mutex_frame_current;
+pthread_mutex_t  mutex_npu;
 vector<Box>	boxes[2]; 
-vector<Box>	boxes_all; 
+vector<BOX_COLOR>	boxes_all; 
 cv::Mat frame;
+Mat knn_frame_npu,knn_bk_npu;
+Mat hot_map;
 int IMG_WID;
 int IMG_HGT;
 int img_h;
@@ -110,7 +120,15 @@ bool is_show_knn_box;
 rknn_context rknn_ctx[2];
 float* input_data[2];
 string labels[91];
-
+imagePair frame_current;
+priority_queue<imagePair, vector<imagePair>, paircompless>
+        queueFrameIn; 
+deque<KNN_S> queueKnn;
+deque<SHOW_KNN> queueShow;
+// priority_queue<imagePair, vector<imagePair>, paircompbig>
+//         queueShow; 
+priority_queue<imagePair, vector<imagePair>, paircompbig>
+        queueNPU0; 
 void *v4l2_thread(void *threadarg);
 
 
@@ -137,6 +155,8 @@ inline pid_t gettid()
 {
   return syscall(__NR_gettid);
 }
+
+
 
 
 int loadLabelName(string locationFilename, string* labels) {
@@ -226,11 +246,13 @@ int scaleToInputSize(float * outputClasses, int (*output)[NUM_RESULTS], int numC
             }
         }
 
-        if (topClassScore >= MIN_SCORE) {
+        if (topClassScoreIndex==1&&topClassScore >= MIN_SCORE) {
             output[0][validCount] = i;
-            output[1][validCount] = topClassScoreIndex;
+            // output[1][validCount] = topClassScoreIndex;
+            output[1][validCount] = (int)topClassScore*100;
             ++validCount;
         }
+        
     }
 
     return validCount;
@@ -284,38 +306,96 @@ inline int set_cpu(int i)
     return 0;  
 } 
 
-void draw_img(Mat &img)
+void draw_img(Mat &img,vector<BOX_COLOR> & boxa_)
 {
     int line_width=300*0.002;
-    for(int i=0;i<(int)boxes_all.size();i++)
+    std::string label;
+    std::ostringstream score_str;
+
+    for(int i=0;i<(int)boxa_.size();i++)
     {
-        Box box=boxes_all[i];
-        cv::rectangle(img, cv::Rect(box.x0, box.y0,(box.x1-box.x0),(box.y1-box.y0)),cv::Scalar(255, 255, 0),line_width);
-        std::ostringstream score_str;
-        score_str<<box.score;
-        std::string label = std::string(labels[box.class_idx]) + ": " + score_str.str();
-        int baseLine = 0;
+        Box box=boxa_[i].box;
+        if(boxa_[i].npu_td_num==0)
+        {
+            cv::rectangle(img, cv::Rect(box.x0, box.y0,(box.x1-box.x0),(box.y1-box.y0)),cv::Scalar(0, 0, 255),line_width);
+            score_str<<box.score;
+            label= /*std::string(labels[box.class_idx]) + */ score_str.str();
+                    int baseLine = 0;
         cv::Size label_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-        cv::rectangle(img, cv::Rect(cv::Point(box.x0,box.y0- label_size.height),
-                                  cv::Size(label_size.width, label_size.height + baseLine)),
-                      cv::Scalar(255, 255, 0), -1);
+        // cv::rectangle(img, cv::Rect(cv::Point(box.x0,box.y0- label_size.height),
+        //                           cv::Size(label_size.width, label_size.height + baseLine)),
+        //               cv::Scalar(0, 0, 255), -1);
         cv::putText(img, label, cv::Point(box.x0, box.y0),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255));
+        }
+        else
+        {
+            cv::rectangle(img, cv::Rect(box.x0, box.y0,(box.x1-box.x0),(box.y1-box.y0)),cv::Scalar(0, 255, 0),line_width);
+            score_str<<box.score;
+            label= /*std::string(labels[box.class_idx]) + */score_str.str();
+                    int baseLine = 0;
+        cv::Size label_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+        // cv::rectangle(img, cv::Rect(cv::Point(box.x0,box.y0- label_size.height),
+        //                           cv::Size(label_size.width, label_size.height + baseLine)),
+        //               cv::Scalar(0, 255, 0), -1);
+        cv::putText(img, label, cv::Point(box.x0, box.y0),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0));
+        }
+
     }
 
 }
+float DecideOverlap(const Rect &r1, const Rect &r2, Rect &r3)
+{
+	//r3 = r1;
+	int x1 = r1.x;
+	int y1 = r1.y;
+	int width1 = r1.width;
+	int height1 = r1.height;
 
-int box_in_which_rec(Box &b0)
+	int x2 = r2.x;
+	int y2 = r2.y;
+	int width2 = r2.width;
+	int height2 = r2.height;
+
+	int endx = max(x1 + width1, x2 + width2);
+	int startx = min(x1, x2);
+	int width = width1 + width2 - (endx - startx);
+
+	int endy = max(y1 + height1, y2 + height2);
+	int starty = min(y1, y2);
+	int height = height1 + height2 - (endy - starty);
+
+	float ratio = 0.0f;
+	float Area, Area1, Area2;
+
+	if (width <= 0 || height <= 0)
+		return 0.0f;
+	else
+	{
+		Area = width*height;
+		Area1 = width1*height1;
+		Area2 = width2*height2;
+		ratio = max(Area / (float)Area1, Area / (float)Area2);
+		r3.x = startx;
+		r3.y = starty;
+		r3.width = endx - startx;
+		r3.height = endy - starty;
+	}
+
+	return ratio;
+}
+int box_in_which_rec(Box &b0 ,KNN_S &kp)
 {
     int pos = 0;
     float percent = 0;
     vector<REC_BOX>::iterator it;
 
     Rect tmp;
-    for(int i=0;i<knn_bgs.boundRect.size();i++)
+    for(int i=0;i<kp.boundRect.size();i++)
     {
-        Rect rbox(b0.x0-knn_bgs.pos_x_in_rec_box[i]+knn_bgs.boundRect[i].rec.x,b0.y0+knn_bgs.boundRect[i].rec.y,b0.x1-b0.x0,b0.y1-b0.y0);
-        float p=knn_bgs.DecideOverlap(rbox,knn_bgs.boundRect[i].rec,tmp);
+        Rect rbox(b0.x0-kp.pos_x_in_rec_box[i]+kp.boundRect[i].rec.x,b0.y0+kp.boundRect[i].rec.y,b0.x1-b0.x0,b0.y1-b0.y0);
+        float p=DecideOverlap(rbox,kp.boundRect[i].rec,tmp);
         if(p>percent)
         {
             pos = i;
@@ -323,7 +403,7 @@ int box_in_which_rec(Box &b0)
         }
         if(percent>0.5)
         {
-            b0.x0 -= knn_bgs.pos_x_in_rec_box[pos];
+            b0.x0 -= kp.pos_x_in_rec_box[pos];
             return pos;
         }
         else  
@@ -332,39 +412,41 @@ int box_in_which_rec(Box &b0)
     return -1;
 }
 
-void togetherAllBox(int th_num,vector<Box> &b0,vector<Box> &b_all )
+void togetherAllBox(int th_num,vector<Box> &b0,vector<BOX_COLOR> &b_all ,KNN_S &kp)
 {
     if(th_num==0)
     {
         for (int i = 0; i<b0.size(); i++) {
             float bx0 = b0[i].x0, by0 = b0[i].y0, bx1= b0[i].x1, by1 = b0[i].y1;
 
-            int pos = box_in_which_rec(b0[i]);            
+            int pos = box_in_which_rec(b0[i],kp);            
             if(pos>=0)
             {
-                knn_bgs.boundRect[pos].have_box = 1;
-                b0[i].x0= bx0 + knn_bgs.boundRect[pos].rec.x;
-                b0[i].y0 = by0 + knn_bgs.boundRect[pos].rec.y;
-                b0[i].x1 = bx1 + knn_bgs.boundRect[pos].rec.x;
-                b0[i].y1 = by1 + knn_bgs.boundRect[pos].rec.y;
-                CLIP(b0[i].x0,0,IMG_WID-1);
-                CLIP(b0[i].y0,0,IMG_HGT-1);
-                CLIP(b0[i].x1,0,IMG_WID-1);
-                CLIP(b0[i].y1,0,IMG_HGT-1);
-                b_all.push_back(b0[i]);
+                BOX_COLOR bc;
+                kp.boundRect[pos].have_box = 1;
+                bc.box.x0= bx0 + kp.boundRect[pos].rec.x;
+                bc.box.y0 = by0 + kp.boundRect[pos].rec.y;
+                bc.box.x1 = bx1 + kp.boundRect[pos].rec.x;
+                bc.box.y1 = by1 + kp.boundRect[pos].rec.y;
+                CLIP(bc.box.x0,0,IMG_WID-1);
+                CLIP(bc.box.y0,0,IMG_HGT-1);
+                CLIP(bc.box.x1,0,IMG_WID-1);
+                CLIP(bc.box.y1,0,IMG_HGT-1);
+                bc.npu_td_num = th_num;
+                b_all.push_back(bc);
             }
 	    }
-        for(int i=0;i<knn_bgs.boundRect.size();i++)
+        for(int i=0;i<kp.boundRect.size();i++)
         {
 
-            if(knn_bgs.boundRect[i].have_box)
+            if(kp.boundRect[i].have_box)
             {
-                Mat	tmp_hotmap = knn_bgs.hot_map(knn_bgs.boundRect[i].rec);
+                Mat	tmp_hotmap = hot_map(kp.boundRect[i].rec);
                 tmp_hotmap.convertTo(tmp_hotmap, tmp_hotmap.type(), 1, 10);
             }
             else
             {
-                Mat	tmp_hotmap = knn_bgs.hot_map(knn_bgs.boundRect[i].rec);
+                Mat	tmp_hotmap = hot_map(kp.boundRect[i].rec);
                 tmp_hotmap.convertTo(tmp_hotmap, tmp_hotmap.type(), 1, -10);
             }
         }
@@ -372,7 +454,10 @@ void togetherAllBox(int th_num,vector<Box> &b0,vector<Box> &b_all )
     else
     {
         for (int i = 0; i<b0.size(); i++) {
-            b_all.push_back(b0[i]);
+          BOX_COLOR bc;
+          bc.box = b0[i];
+          bc.npu_td_num = th_num;
+          b_all.push_back(bc);
         }
     }
 
@@ -404,12 +489,12 @@ void post_process_ssd(vector<Box> & box_,int thread_num,int raw_h,int raw_w, flo
     printf("[%d] detect ruesult num: %d \n",thread_num,num);
     for (int i=0;i<num;i++)
     {
-        if(outp[0][i] != -1&&outp[1][i]==1)
+        if(outp[0][i] != -1/*&&outp[1][i]==1*/)
         {
             int n = outp[0][i];
             Box box;
-            box.class_idx=outp[1][i];
-            box.score=0;
+            // box.class_idx=outp[1][i];
+            box.score=outp[1][i];
             box.x0=pred[n * 4 + 1]*raw_w;
             box.y0=pred[n * 4 + 0]*raw_h;
             box.x1=pred[n * 4 + 3]*raw_w;
@@ -419,7 +504,7 @@ void post_process_ssd(vector<Box> & box_,int thread_num,int raw_h,int raw_w, flo
             CLIP(box.x1,0,IMG_WID-1);
             CLIP(box.y1,0,IMG_HGT-1);
             box_.push_back(box);
-            printf("[%d]  %s\t:%.0f%%\n",thread_num, labels[box.class_idx].c_str(), box.score * 100);
+            printf("[%d]  %.0f%%\n",thread_num, box.score * 100);
             printf("[%d]  BOX:( %g , %g ),( %g , %g )\n",thread_num,box.x0,box.y0,box.x1,box.y1);
 
         }
@@ -428,35 +513,114 @@ void post_process_ssd(vector<Box> & box_,int thread_num,int raw_h,int raw_w, flo
 
 void mssd_core(rknn_context &ctx, int thread_num )
 {
-    // cout<<"["<<frame_cnt<<"] "<<"thread_num "<<thread_num<<endl;
+
     struct timeval t0, t1;
     float total_time = 0.f;
     gettimeofday(&t0, NULL);
-
+    
     Mat	img_roi;
+    Mat show_img;
+    KNN_S kp;
+    imagePair ip;
+    
     if(thread_num == 0)
     {
-      set_cpu(2);
         // return;
-        for(int i=0;i<knn_bgs.boundRect.size();i++)
+        pthread_mutex_lock(&mutex_knn);
+        if(!queueKnn.empty())
         {
-            pthread_mutex_lock(&mutex_show_img);
-            Mat	img_show = show_img(knn_bgs.boundRect[i].rec);
-            img_show.convertTo(img_show, img_show.type(), 1, 30);
-            pthread_mutex_unlock(&mutex_show_img);
+          // cout<<"NPU0 queueKnn not empty!"<<endl;
+          kp = queueKnn.front();
+          queueKnn.pop_front();
+          pthread_mutex_unlock(&mutex_knn);
+          int knn_time_sync = kp.time;
+          bool is_not_found = true;
+          pthread_mutex_lock(&mutex_frameIn);
+          while(true)
+          {
+            if(!queueFrameIn.empty())
+            {
+              if(queueFrameIn.top().first>=knn_time_sync)
+                {
+                  // cout<<"NPU0 found knn--frame "<<knn_time_sync<<"--"<<queueFrameIn.top().first<<endl;
+                  is_not_found = false;
+                  imagePair ip0;
+                  ip0.first = knn_time_sync;
+                  ip0.second = queueFrameIn.top().second;
+                  pthread_mutex_lock(&mutex_npu);
+                  queueNPU0.push(ip0);
+                  pthread_mutex_unlock(&mutex_npu);
+                  queueFrameIn.pop();
+                  break;
+                }
+                queueFrameIn.pop();
+            }
+            else
+            {
+              break;
+            }
+            
+          }
+          pthread_mutex_unlock(&mutex_frameIn);
+
+          pthread_mutex_lock(&mutex_npu);
+          if(is_not_found)
+          {
+                // cout<<"NPU0 not found knn--frame "<<knn_time_sync<<endl;
+                imagePair ip0;
+                ip0.first = knn_time_sync;
+                pthread_mutex_lock(&mutex_frame_current);
+                ip0.second = frame_current.second;
+                pthread_mutex_unlock(&mutex_frame_current);
+                queueNPU0.push(ip0);
+          }
+          show_img = queueNPU0.top().second.clone();
+          pthread_mutex_unlock(&mutex_npu);
+
+          for(int i=0;i<kp.boundRect.size();i++)
+          {
+              Mat	img_show = show_img(kp.boundRect[i].rec);
+              img_show.convertTo(img_show, img_show.type(), 1, 30);
+          }
+            imagePair ips;
+            ips.first=knn_time_sync;
+            ips.second = show_img;
+            
+            pthread_mutex_lock(&mutex_knn);
+            sk_.fgmask = knn_bgs.FGMask;
+            pthread_mutex_unlock(&mutex_knn);
+            sk_.puzzle = kp.puzzle;
+            sk_.show_img=show_img;
+            img_roi = kp.puzzle;
         }
-        pthread_mutex_lock(&mutex_knn_bgs_frame);
-        img_roi = knn_bgs.puzzle_mat.clone();
-        pthread_mutex_unlock(&mutex_knn_bgs_frame);
+        else
+        {
+          pthread_mutex_unlock(&mutex_knn);
+          // rknn_outputs_release(ctx, 2, outputs);
+          return;
+        }
+        
     }
     else
     {
-      set_cpu(3);
-        pthread_mutex_lock(&mutex_knn_bgs_frame);
-        img_roi = knn_bgs.frame.clone();
-        pthread_mutex_unlock(&mutex_knn_bgs_frame);
+      
+      pthread_mutex_lock(&mutex_npu);
+      if(!queueNPU0.empty())
+      {
+        ip = queueNPU0.top();
+        img_roi = ip.second;
+        queueNPU0.pop();
+      }
+      else
+      {
+        pthread_mutex_unlock(&mutex_npu);
+        // rknn_outputs_release(ctx, 2, outputs);
+        return;
+      }
+      
+      pthread_mutex_unlock(&mutex_npu);
     }
-    
+    // cout<<"["<<frame_cnt<<"] "<<"npu thread_num in "<<thread_num<<endl;
     int raw_h = img_roi.size().height;
     int raw_w = img_roi.size().width;
         // Start Inference
@@ -533,42 +697,135 @@ void mssd_core(rknn_context &ctx, int thread_num )
         nms(validCount, predictions, output);
         post_process_ssd(boxes[thread_num],thread_num,raw_h,raw_w,predictions,output,validCount);
 
-        pthread_mutex_lock(&mutex_box);
-        togetherAllBox(thread_num, boxes[thread_num], boxes_all);
-        pthread_mutex_unlock(&mutex_box);
+      
+        pthread_mutex_lock(&mutex_hotmap_box);
+        togetherAllBox(thread_num, boxes[thread_num], boxes_all,kp);
+        pthread_mutex_unlock(&mutex_hotmap_box);
     }
     rknn_outputs_release(ctx, 2, outputs);
     gettimeofday(&t1, NULL);
     float mytime = ( float )((t1.tv_sec * 1000000 + t1.tv_usec) - (t0.tv_sec * 1000000 + t0.tv_usec)) / 1000;
+    if(thread_num ==0)
+      npu_calc[0] = true;
+    else
+    npu_calc[1] = true;
 
-    std::cout<<"["<<frame_cnt<<"] " <<"thread " << thread_num << " times  " << mytime << "ms\n";
+      
+    std::cout<<"[NPU] " <<"thread " << thread_num << " times  " << mytime << "ms\n";
 }
 
-void *cpu_pthread(void *threadarg)
+void *npu0_pthread(void *threadarg)
 {
-    mssd_core(rknn_ctx[1], 1);
-}
-void *gpu_pthread(void *threadarg)
-{
+    set_cpu(2);
     mssd_core(rknn_ctx[0], 0);
 }
+void *npu1_pthread(void *threadarg)
+{
+  set_cpu(3);
+  mssd_core(rknn_ctx[1], 1);
+}
+void *npu_pthread(void *threadarg)
+{
+  set_cpu(5);
+  while(1)
+  {
+    // std::cout<<"["<<frame_cnt<<"] " <<"npu_pthread in\n";
+    pthread_t threads_npu0;      
+    pthread_t threads_npu1;
+    pthread_create(&threads_npu0, NULL, npu0_pthread, NULL);
+    pthread_create(&threads_npu1, NULL, npu1_pthread,NULL);
+    pthread_join(threads_npu0,NULL);
+    pthread_join(threads_npu1,NULL);
+    if(npu_calc[0] && npu_calc[1])
+    {
+      cout<<"NPU calc"<<endl;
+      npu_calc[0] = false;
+      npu_calc[1] = false;
+      pthread_mutex_lock(&mutex_show);
+      queueShow.push_back(sk_);
+      pthread_mutex_unlock(&mutex_show);
+    }
+    // std::cout<<"["<<frame_cnt<<"] " <<"npu_pthread out\n";
+    usleep(100);
+  }
 
+}
 void *knn_diff_pthread(void *threadarg)
 {
-  set_cpu(0);
-  knn_bgs.diff2(knn_bgs.frame, knn_bgs.bk);
+  set_cpu(2);
+  // std::cout<<"["<<frame_cnt<<"] " <<"knn_diff_pthread in\n";
+  knn_bgs.diff2(knn_frame_npu, knn_bk_npu);
+  // std::cout<<"["<<frame_cnt<<"] " <<"knn_diff_pthread out\n";
 }
 void *knn_core_pthread(void *threadarg)
 {
-  set_cpu(1);
-  knn_bgs.knn_core();
+  set_cpu(3);
+  // std::cout<<"["<<frame_cnt<<"] " <<"knn_core_pthread in\n";
+  pthread_mutex_lock(&mutex_hotmap_box);
+  knn_bgs.knn_core(hot_map);
+  pthread_mutex_unlock(&mutex_hotmap_box);
+  // std::cout<<"["<<frame_cnt<<"] " <<"knn_core_pthread out\n";
 }
+
+void *knn_pthread(void *threadarg)
+{
+  set_cpu(4);
+  while(1)
+  {
+    pthread_mutex_lock(&mutex_knn);
+    bool knn_empty = queueKnn.empty();
+    pthread_mutex_unlock(&mutex_knn);
+    pthread_mutex_lock(&mutex_frame_current);
+    if(!queueFrameIn.empty()&&knn_empty)
+        {
+          __TIC__(knn_pthread);
+          // std::cout<<"["<<frame_cnt<<"] " <<"knn_pthread in\n";
+          int knn_tmie = frame_current.first;
+          frame_current.first =0;
+          knn_bgs.frame = frame_current.second.clone();
+          pthread_mutex_unlock(&mutex_frame_current);
+          knn_bgs.pos ++;
+          knn_bgs.boundRect.clear();
+          knn_frame_npu = knn_bgs.frame.clone();
+          knn_bk_npu = knn_bgs.bk.clone();
+          pthread_t threads_knn_diff;      
+          pthread_t threads_knn_core;
+          pthread_create(&threads_knn_diff, NULL, knn_diff_pthread, NULL);
+          pthread_create(&threads_knn_core, NULL, knn_core_pthread,NULL);
+          pthread_join(threads_knn_diff,NULL);
+          pthread_join(threads_knn_core,NULL);
+          pthread_mutex_lock(&mutex_hotmap_box);
+          knn_bgs.add_diff_in_box_to_mask(boxes_all,hot_map);
+          pthread_mutex_unlock(&mutex_hotmap_box);
+          knn_bgs.processRects();
+          knn_bgs.knn_puzzle(knn_bgs.frame);
+
+
+          KNN_S kp;
+          kp.time = knn_tmie;
+          kp.boundRect.assign(knn_bgs.boundRect.begin(),knn_bgs.boundRect.end());
+          kp.puzzle = knn_bgs.puzzle_mat;
+          kp.pos_x_in_rec_box.assign(knn_bgs.pos_x_in_rec_box.begin(),knn_bgs.pos_x_in_rec_box.end());
+          pthread_mutex_lock(&mutex_knn);
+          queueKnn.push_back(kp);
+          pthread_mutex_unlock(&mutex_knn);
+          // std::cout<<"["<<frame_cnt<<"] " <<"knn_pthread out\n";
+          __TOC__(knn_pthread);
+        }
+        else
+        {
+          pthread_mutex_unlock(&mutex_frame_current);
+        }
+        
+  }
+}
+
 int main(int argc, char* argv[])
 {
-  set_cpu(5);
+    set_cpu(0);
+    gettimeofday(&show_img_time, NULL);
     frame_cnt = 0;
     quit = false;
-    bool first =true;
     int first_cnt =0;
     std::string in_video_file;
     std::string out_video_file;
@@ -598,14 +855,13 @@ int main(int argc, char* argv[])
     // IMG_HGT = capture.get(CV_CAP_PROP_FRAME_HEIGHT);
     // Size sWH = Size( 2*IMG_WID,2*IMG_HGT);
     // outputVideo.open(out_video_file.c_str(), cv::VideoWriter::fourcc ('M', 'P', '4', '2'), 25, sWH);
+    frame_current.first=0;
+    frame_current.second.create(IMG_HGT,IMG_WID,CV_8UC3);
+    frame_current.second=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
     frame.create(IMG_HGT,IMG_WID,CV_8UC3);
-    process_frame.create(IMG_HGT,IMG_WID,CV_8UC3);
-    show_img.create(IMG_HGT,IMG_WID,CV_8UC3);
-    show_img = Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
-    background=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
     frame = Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
-    final_img.create(IMG_HGT,IMG_WID,CV_8UC3);
-    final_img = Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
+    hot_map.create(IMG_HGT,IMG_WID,CV_8UC1);
+    hot_map=Mat::ones(IMG_HGT,IMG_WID,CV_8UC1)+100;
 
     screen_.init((char *)"/dev/fb0",640,480);
     pfb = (unsigned int *)malloc(screen_.finfo.smem_len);
@@ -625,12 +881,20 @@ int main(int argc, char* argv[])
     knn_bgs.tooSmalltoDrop = knn_conf[4];
     knn_bgs.dilateRatio =  knn_bgs.IMG_WID  / 320 * 5;
     knn_bgs.init();
-    boxes_all.clear();
+    
 
-	pthread_t threads_v4l2;
-	int rc = pthread_create(&threads_v4l2, NULL, v4l2_thread, NULL);
-  pthread_detach(threads_v4l2);
-
+    while(1){
+      v4l2_.read_frame(frame);
+        first_cnt++;
+        if(first_cnt >= 10)
+        {
+            knn_bgs.bk = frame.clone();
+            break;
+        }
+        else
+            continue;      
+    }
+    cout<<"V4L2 init bk done!"<<endl;
     // Load model
     loadLabelName(label_path, labels);
     FILE *fp = fopen(model_path, "rb");
@@ -653,6 +917,7 @@ int main(int argc, char* argv[])
   {
     rknn_ctx[i] = 0;
     ret = rknn_init(&rknn_ctx[i], model, model_len, RKNN_FLAG_PRIOR_MEDIUM);
+    
     if(ret < 0) {
         printf("rknn_init fail! ret=%d\n", ret);
         // goto Error;
@@ -660,165 +925,123 @@ int main(int argc, char* argv[])
     cout<<"init NPU "<<i<<" done!"<<endl;
   }
 
+	pthread_t threads_v4l2;
+  pthread_t threads_knn;      
+  pthread_t threads_npu;   
+  pthread_create(&threads_v4l2, NULL, v4l2_thread, NULL);
+  pthread_create(&threads_knn, NULL, knn_pthread, NULL);
+  pthread_create(&threads_npu, NULL,npu_pthread, NULL);
+  pthread_join(threads_v4l2,NULL);
+  pthread_join(threads_knn,NULL);
+  pthread_join(threads_npu,NULL);
 
-    while(1){
-
-        // if (!capture.read(frame))
-		// {
-		// 	cout<<"cannot open video or end of video"<<endl;
-        //     break;
-		// }
-        frame_cnt++;
-        if(first)
-        {
-            first_cnt++;
-            if(first_cnt >= 10)
-            {
-                background = frame.clone();
-                knn_bgs.bk = frame.clone();
-                first = false;
-            }
-            else
-                continue;      
-        }
-
-        __TIC__(KNN_CLONE);
-        process_frame = frame.clone();
-        pthread_mutex_lock(&mutex_show_img);
-        show_img = frame.clone();
-        pthread_mutex_unlock(&mutex_show_img);
-        pthread_mutex_lock(&mutex_knn_bgs_frame);
-        knn_bgs.frame = process_frame.clone();
-        pthread_mutex_unlock(&mutex_knn_bgs_frame);
-        __TOC__(KNN_CLONE);
-        knn_bgs.pos ++;
-        knn_bgs.boundRect.clear();
-
-
-
-        __TIC__(KNN_CORE_DIFF);
-        pthread_t threads_knn_diff;      
-        pthread_t threads_knn_core;
-        pthread_create(&threads_knn_diff, NULL, knn_diff_pthread, NULL);
-        pthread_create(&threads_knn_core, NULL, knn_core_pthread,NULL);
-        pthread_join(threads_knn_diff,NULL);
-        pthread_join(threads_knn_core,NULL);
-        __TOC__(KNN_CORE_DIFF);
-        // __TIC__(KNN_DIFF);
-        // knn_bgs.diff2(process_frame, knn_bgs.bk);
-        // __TOC__(KNN_DIFF);
-        //  __TIC__(KNN_CORE);
-        // knn_bgs.knn_core();
-        // __TOC__(KNN_CORE);
-        __TIC__(KNN_REC);
-        pthread_mutex_lock(&mutex_box);
-        knn_bgs.processRects(boxes_all);
-        pthread_mutex_unlock(&mutex_box);
-        __TOC__(KNN_REC);
-        boxes_all.clear();
-        __TIC__(KNN_PUZZ);
-        knn_bgs.knn_puzzle(process_frame);
-        for(int i=0;i<2;i++)
-            boxes[i].clear();
-        __TOC__(KNN_PUZZ);
-
-        __TIC__(NPU);
-        pthread_t threads_c;      
-        pthread_t threads_gpu;
-        pthread_create(&threads_gpu, NULL, gpu_pthread, NULL);
-        pthread_create(&threads_c, NULL, cpu_pthread,NULL);
-
-        pthread_join(threads_c,NULL);
-        pthread_join(threads_gpu,NULL);
-        __TOC__(NPU);
-
-        __TIC__(SHOW);
-        if(is_show_knn_box)
-        {
-            pthread_mutex_lock(&mutex_show_img);
-            draw_img(show_img);
-        
-            Mat out,hot_map_color,hot_map_color2,hot_map_thresh_color,hot_map;
-            hot_map = knn_bgs.hot_map;
-
-            cv::cvtColor(knn_bgs.FGMask, hot_map_color2, CV_GRAY2BGR);  
-            cv::cvtColor(knn_bgs.hot_map, hot_map_thresh_color, CV_GRAY2BGR);  
-            //hconcat(show_img,knn_bgs.bk,out);
-            resize(knn_bgs.puzzle_mat, knn_bgs.puzzle_mat, show_img.size(), 0, 0,  cv::INTER_LINEAR); 
-            hconcat(show_img,knn_bgs.puzzle_mat,out);
-            hconcat(hot_map_color2,hot_map_thresh_color,hot_map_color2);
-            vconcat(out,hot_map_color2,out);
-    
-            string no=to_string(frame_cnt);
-            Point siteNo;
-            siteNo.x = 25;
-            siteNo.y = 25;
-            putText( out, no, siteNo, 2,1,Scalar( 255, 0, 0 ), 4);
-            resize(out, show_img, show_img.size(), 0, 0,  cv::INTER_LINEAR); 
-            final_img = show_img.clone();
-            pthread_mutex_unlock(&mutex_show_img);
-        }
-        else
-        {
-            pthread_mutex_lock(&mutex_box);
-             screen_.v_draw.clear();
-             for (int i = 0; i<boxes_all.size(); i++) {
-                 draw_box box_tmp{Point(boxes_all[i].x0,boxes_all[i].y0),Point(boxes_all[i].x1,boxes_all[i].y1),0};
-               screen_.v_draw.push_back(box_tmp);
-                }
-            pthread_mutex_unlock(&mutex_box);
-        }
-
-
-        // cv::imshow("MSSD", out);
-        // cv::waitKey(10) ;
-        // outputVideo.write(out);
-        __TOC__(SHOW);
-        std::cout<<"["<<frame_cnt<<"] " <<" --------------------------------------------------------------------------\n";
-        //cv::imshow("MSSD", frame);
-        //cv::waitKey(10) ;
-    }
-    
-    for(int i=0;i<2;i++)
-    {
-;
-    }
-
-
-    return 0;
+  return 0;
 }
 
 
 void *v4l2_thread(void *threadarg)
 {
-    set_cpu(4);
+    set_cpu(1);
 	while (1)
 	{
         if(is_show_img)
         {
             if(is_show_knn_box)
             {
-                pthread_mutex_lock(&mutex_knn_bgs_frame);
-                v4l2_.read_frame(frame);
-                pthread_mutex_unlock(&mutex_knn_bgs_frame);
-                pthread_mutex_lock(&mutex_show_img);
-                v4l2_. mat_to_argb(final_img.data,pfb,640,480,screen_.vinfo.xres_virtual,0,0);
-                pthread_mutex_unlock(&mutex_show_img);
-                memcpy(screen_.pfb,pfb,screen_.finfo.smem_len);
-            }
-            else
-            {
-                pthread_mutex_lock(&mutex_knn_bgs_frame);
-                v4l2_.read_frame_argb(pfb,frame,screen_.vinfo.xres_virtual,0,0);
-                pthread_mutex_unlock(&mutex_knn_bgs_frame);
-                pthread_mutex_lock(&mutex_box);
-                screen_.refresh_draw_box(pfb,0,0);
-                pthread_mutex_unlock(&mutex_box);
-                memcpy(screen_.pfb,pfb,screen_.finfo.smem_len);
+                // std::cout<<"["<<frame_cnt<<"] " <<"v4l2_thread in\n";
+                pthread_mutex_lock(&mutex_frameIn);
+                if(queueFrameIn.empty())
+                {
+                  pthread_mutex_unlock(&mutex_frameIn);
+                  __TIC__(v4l2_thread);
+                  frame_cnt++;
+                  v4l2_.read_frame(frame);
+                  int time_ = getTimesInt();
+                  pthread_mutex_lock(&mutex_frame_current);
+                  frame_current.first = time_;
+                  frame_current.second=frame;
+                  pthread_mutex_unlock(&mutex_frame_current);
+                  imagePair pframe(time_,frame);
+                  pthread_mutex_lock(&mutex_frameIn);
+                  queueFrameIn.push(pframe);
+                  pthread_mutex_unlock(&mutex_frameIn);
+                  __TOC__(v4l2_thread);
+                }
+                else
+                {
+                  pthread_mutex_unlock(&mutex_frameIn);
+                }
+                
+
+                pthread_mutex_lock(&mutex_show);
+                if(!queueShow.empty())
+                {
+                  __TIC__(v4l2_show);
+                  Mat show_img = queueShow.front().show_img;
+                  Mat fgmsak = queueShow.front().fgmask;
+                  Mat puzzle_mat = queueShow.front().puzzle;
+                  queueShow.pop_front();
+                  pthread_mutex_unlock(&mutex_show);
+                  Mat out,hot_map_color,hot_map_color2,hot_map_thresh_color;
+                  
+                  pthread_mutex_lock(&mutex_hotmap_box);
+                  draw_img(show_img,boxes_all);
+                  boxes_all.clear();
+                  cv::cvtColor(hot_map, hot_map_thresh_color, CV_GRAY2BGR);  
+                  pthread_mutex_unlock(&mutex_hotmap_box);
+
+                  pthread_mutex_lock(&mutex_knn);
+                  cv::cvtColor(fgmsak, hot_map_color2, CV_GRAY2BGR);  
+                  //hconcat(show_img,knn_bgs.bk,out);
+                  resize(puzzle_mat, puzzle_mat, show_img.size(), 0, 0,  cv::INTER_LINEAR); 
+                  hconcat(show_img,puzzle_mat,out);
+                  pthread_mutex_unlock(&mutex_knn);
+                  hconcat(hot_map_color2,hot_map_thresh_color,hot_map_color2);
+                  vconcat(out,hot_map_color2,out);
+          
+
+                  std::ostringstream fps_stream;
+                  std::string fps_str;
+                  struct timeval t1;
+                  gettimeofday(&t1, NULL);
+                  float mytime = ( float )((t1.tv_sec * 1000000 + t1.tv_usec) - (show_img_time.tv_sec * 1000000 + show_img_time.tv_usec)) / 1000;
+                  float fps = 1000.0/mytime;
+                  fps_stream <<fps;
+                  fps_str = "fps:"+fps_stream.str();
+
+                  // string no=to_string(frame_cnt);
+                  Point siteNo;
+                  siteNo.x = 25;
+                  siteNo.y = 25;
+                  putText( out, fps_str, siteNo, 2,1,Scalar( 255, 0, 0 ), 4);
+                  resize(out, show_img, show_img.size(), 0, 0,  cv::INTER_LINEAR); 
+            
+                  v4l2_. mat_to_argb(show_img.data,pfb,640,480,screen_.vinfo.xres_virtual,0,0);
+                  memcpy(screen_.pfb,pfb,screen_.finfo.smem_len);
+                  __TOC__(v4l2_show);
+                  cout<<"fps   "<<fps_str <<endl;
+                gettimeofday(&show_img_time, NULL);
+
+                pthread_mutex_lock(&mutex_frameIn);
+                cout<<"queueFrameIn.size() "<<queueFrameIn.size()<<endl;
+                pthread_mutex_unlock(&mutex_frameIn);
+                pthread_mutex_lock(&mutex_knn);
+                cout<<"queueKnn.size() "<<queueKnn.size()<<endl;
+                pthread_mutex_unlock(&mutex_knn);
+                cout<<"queueShow.size() "<<queueShow.size()<<endl;
+                pthread_mutex_lock(&mutex_npu);
+                cout<<"queueNPU0.size() "<<queueNPU0.size()<<endl;
+                pthread_mutex_unlock(&mutex_npu);
+                }
+                else
+                {
+                  pthread_mutex_unlock(&mutex_show);
+                }
+                // std::cout<<"["<<frame_cnt<<"] " <<"v4l2_thread out\n";
+                
             }
         }
-        else
-            v4l2_.read_frame(frame);
+
         sleep(0.01); 
         if (quit)
             break;

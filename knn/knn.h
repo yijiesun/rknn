@@ -43,7 +43,7 @@ public:
 	vector<int> pos_x_in_rec_box;
 	vector<REC_BOX> boundRect;
 	void init();
-	void knn_core();
+	void knn_core(Mat &hot_map);
 	void saveROI();
 	Mat PixelHistory_gray[2];
 	Mat PixelHistory_isBG[2];
@@ -54,12 +54,12 @@ public:
 	Mat bk;
 	Mat process_frame;
 	Mat puzzle_mat;
-	Mat hot_map,hot_map_noraml,hot_map_thresh;
+	Mat hot_map_noraml,hot_map_thresh;
 	Mat bit_and_hotmap_with_diff;
 	Mat human_roi;//记录友好大小的行人出没热点区域
 	cv::Mat frame, fgray, FGMask, showImg,DiffMask,FGMask_origin;
 	void postTreatment(Mat &mat);
-	void processRects(vector<Box> &box);
+	void processRects();
 	void addBoxToRecs();
 	void getTopRects(vector<Rect> &rects0, vector<REC_BOX> &rects);
 	//bool sortFun(const cv::Rect &p1, const cv::Rect &p2);
@@ -72,7 +72,7 @@ public:
 	void paddingRecs(vector<REC_BOX> &rects, int size);
 	void insideDilate(Mat & bimg, Mat & bout, int win_size, int scale);
 	void diff2(Mat &cur,Mat &las);
-	void add_diff_in_box_to_mask(vector<Box> &box);
+	void add_diff_in_box_to_mask(vector<BOX_COLOR> &box,Mat &hot_map);
 	void update_bg();
 	void knn_puzzle(Mat &frame);
 	int find_son_block(vector<Rect> &rects,int begin,int max_wid,int max_hgt);

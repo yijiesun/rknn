@@ -20,11 +20,17 @@ struct Box
     int class_idx;
     float score;
 };
+struct BOX_COLOR
+{
+  Box box;
+  int npu_td_num;
+};
 struct BoxInROI
 {
     struct Box boxs;
     cv::Rect rects;
 };
+int getTimesInt();
 void getTimesSecf(char *param);
 void getTimesSec(char *param);
 bool _str_cmp(char* a, char *b);

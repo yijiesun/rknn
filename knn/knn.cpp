@@ -51,16 +51,15 @@ void KNN_BGS::init()
 	// 	memset(framePixelHistory[i].gray, 0, (history_num ) * sizeof(unsigned char));
 	// 	memset(framePixelHistory[i].IsBG, 0, (history_num ) * sizeof(unsigned char));
 	// }
-	hot_map.create(IMG_HGT,IMG_WID,CV_8UC1);
-	hot_map=Mat::ones(IMG_HGT,IMG_WID,CV_8UC1)+100;
+
 }
 
-void KNN_BGS::knn_core()
+void KNN_BGS::knn_core(Mat &hot_map)
 {
 	knn_use_box.clear();
-	cout<<"knn_core"<<endl;
+	// cout<<"knn_core"<<endl;
 	cv::cvtColor(frame, fgray, CV_BGR2GRAY);
-	cout<<"CV_BGR2GRAY"<<endl;
+	// cout<<"CV_BGR2GRAY"<<endl;
 	FGMask_origin.setTo(Scalar(255));
 	int gray = 0;
 
@@ -239,17 +238,17 @@ void KNN_BGS::addBoxToRecs()
 
 }
 
-void KNN_BGS::add_diff_in_box_to_mask(vector<Box> &box)
+void KNN_BGS::add_diff_in_box_to_mask(vector<BOX_COLOR> &box,Mat &hot_map)
 {
 
 	for (int i = 0; i<box.size(); i++) {
 
-		box[i].show_cnt =0;
-		knn_use_box.push_back(box[i]);
-		int x0 = box[i].x0-2*padSize;
-		int y0 = box[i].y0-2*padSize;
-		int w0 = box[i].x1-box[i].x0+4*padSize;
-		int h0 = box[i].y1-box[i].y0+4*padSize;
+		box[i].box.show_cnt =0;
+		knn_use_box.push_back(box[i].box);
+		int x0 = box[i].box.x0-2*padSize;
+		int y0 = box[i].box.y0-2*padSize;
+		int w0 = box[i].box.x1-box[i].box.x0+4*padSize;
+		int h0 = box[i].box.y1-box[i].box.y0+4*padSize;
 		CLIP(x0,0,IMG_WID-1);
 		CLIP(y0,0,IMG_HGT-1);
 		CLIP(w0,1,IMG_WID-x0 -1);
@@ -291,9 +290,9 @@ void KNN_BGS::add_diff_in_box_to_mask(vector<Box> &box)
 	bk_cnt+=senser_roi_down100;
 
 }
-void KNN_BGS::processRects(vector<Box> &box)
+void KNN_BGS::processRects()
 {
-	add_diff_in_box_to_mask(box);
+	// add_diff_in_box_to_mask(box);
 	FGMask = FGMask_origin.clone();
 	 postTreatment(FGMask);
 
@@ -484,7 +483,7 @@ void KNN_BGS::knn_puzzle(Mat &frame)
 		
 		
 	}
-	if(total_wid==0&&total_hgt==0)
+	if(total_wid==0||total_hgt==0)
 	{
 		puzzle_mat=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
 	}
