@@ -249,7 +249,7 @@ int scaleToInputSize(float * outputClasses, int (*output)[NUM_RESULTS], int numC
         if (topClassScoreIndex==1&&topClassScore >= MIN_SCORE) {
             output[0][validCount] = i;
             // output[1][validCount] = topClassScoreIndex;
-            output[1][validCount] = (int)topClassScore*100;
+            output[1][validCount] = static_cast< int >(topClassScore*100.0);
             ++validCount;
         }
         
@@ -494,7 +494,7 @@ void post_process_ssd(vector<Box> & box_,int thread_num,int raw_h,int raw_w, flo
             int n = outp[0][i];
             Box box;
             // box.class_idx=outp[1][i];
-            box.score=outp[1][i];
+            box.score=(float)outp[1][i]/100.0;
             box.x0=pred[n * 4 + 1]*raw_w;
             box.y0=pred[n * 4 + 0]*raw_h;
             box.x1=pred[n * 4 + 3]*raw_w;
@@ -504,7 +504,7 @@ void post_process_ssd(vector<Box> & box_,int thread_num,int raw_h,int raw_w, flo
             CLIP(box.x1,0,IMG_WID-1);
             CLIP(box.y1,0,IMG_HGT-1);
             box_.push_back(box);
-            printf("[%d]  %.0f%%\n",thread_num, box.score * 100);
+            printf("[%d]  %.0f%%\n",thread_num, box.score * 100.0);
             printf("[%d]  BOX:( %g , %g ),( %g , %g )\n",thread_num,box.x0,box.y0,box.x1,box.y1);
 
         }
@@ -534,7 +534,6 @@ void mssd_core(rknn_context &ctx, int thread_num )
           queueKnn.pop_front();
           pthread_mutex_unlock(&mutex_knn);
           int knn_time_sync = kp.time;
-          bool is_not_found = true;
           pthread_mutex_lock(&mutex_frameIn);
           while(true)
           {
@@ -543,7 +542,6 @@ void mssd_core(rknn_context &ctx, int thread_num )
               if(queueFrameIn.top().first>=knn_time_sync)
                 {
                   // cout<<"NPU0 found knn--frame "<<knn_time_sync<<"--"<<queueFrameIn.top().first<<endl;
-                  is_not_found = false;
                   imagePair ip0;
                   ip0.first = knn_time_sync;
                   ip0.second = queueFrameIn.top().second;
@@ -564,7 +562,7 @@ void mssd_core(rknn_context &ctx, int thread_num )
           pthread_mutex_unlock(&mutex_frameIn);
 
           pthread_mutex_lock(&mutex_npu);
-          if(is_not_found)
+          if(queueNPU0.empty())
           {
                 // cout<<"NPU0 not found knn--frame "<<knn_time_sync<<endl;
                 imagePair ip0;
@@ -579,6 +577,13 @@ void mssd_core(rknn_context &ctx, int thread_num )
 
           for(int i=0;i<kp.boundRect.size();i++)
           {
+              Rect roi_ = kp.boundRect[i].rec;
+              CLIP(roi_.x,0,(show_img.size().width-1));
+              CLIP(roi_.y,0,(show_img.size().height-1));
+              CLIP(roi_.width,0,(show_img.size().width-roi_.x-1));
+              CLIP(roi_.height,0,(show_img.size().height-roi_.y-1));
+              cout<<"mssd_core 587 show_img.size "<<show_img.size()<<endl;
+              cout<<"mssd_core 588 roi_ "<<roi_<<endl;
               Mat	img_show = show_img(kp.boundRect[i].rec);
               img_show.convertTo(img_show, img_show.type(), 1, 30);
           }
@@ -646,7 +651,7 @@ void mssd_core(rknn_context &ctx, int thread_num )
         printf("rknn_query fail! ret=%d\n", ret);
         // goto Error;
     }
-
+    cout<<"mssd_core 654 img_roi.size "<<img_roi.size()<<endl;
     cv::resize(img_roi, img_roi, cv::Size(img_width, img_height), (0, 0), (0, 0), cv::INTER_LINEAR);
     inputs[0].index = input_index;
     inputs[0].buf = img_roi.data;
@@ -993,6 +998,8 @@ void *v4l2_thread(void *threadarg)
                   pthread_mutex_lock(&mutex_knn);
                   cv::cvtColor(fgmsak, hot_map_color2, CV_GRAY2BGR);  
                   //hconcat(show_img,knn_bgs.bk,out);
+                  cout<<"draw img 1003 : puzzle size:"<<puzzle_mat.size()<<endl;
+                  cout<<"draw img  1004: show_img size:"<<show_img.size()<<endl;
                   resize(puzzle_mat, puzzle_mat, show_img.size(), 0, 0,  cv::INTER_LINEAR); 
                   hconcat(show_img,puzzle_mat,out);
                   pthread_mutex_unlock(&mutex_knn);

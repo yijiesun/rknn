@@ -485,6 +485,7 @@ void KNN_BGS::knn_puzzle(Mat &frame)
 	}
 	if(total_wid==0||total_hgt==0)
 	{
+		puzzle_mat.create(IMG_HGT,IMG_WID,CV_8UC3);
 		puzzle_mat=Mat::zeros(IMG_HGT,IMG_WID,CV_8UC3);
 	}
 	else
